@@ -1,0 +1,22 @@
+# AeroGuard Configuration File
+detection:
+  confidence_threshold: 0.25
+  iou_threshold: 0.5
+  model_path: "models/yolov8n.pt"
+
+slam:
+  focal_length: 800
+  max_features: 2000
+  feature_match_ratio: 0.75
+
+dust_simulation:
+  voxel_size_cm: 10
+  room_height_cm: 250
+  fan_speed_default: 50
+  window_open_default: false
+  humidity_default: 50
+  aqi_default: 100
+
+visualization:
+  heatmap_opacity: 0.6
+  point_cloud_size: 2

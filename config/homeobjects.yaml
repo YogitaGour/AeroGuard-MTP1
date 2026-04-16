@@ -1,0 +1,17 @@
+path: datasets/HomeObjects
+train: images/train
+val: images/val
+nc: 12
+names:
+  - bed
+  - sofa
+  - chair
+  - table
+  - lamp
+  - tv
+  - laptop
+  - wardrobe
+  - window
+  - door
+  - potted plant
+  - picture frame
