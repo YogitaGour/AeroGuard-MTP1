@@ -6,3 +6,4 @@ Pillow
 ultralytics
 torch
 torchvision
+plotly==5.20.0
