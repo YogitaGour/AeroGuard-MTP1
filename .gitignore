@@ -1,13 +1,84 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
 .venv/
 venv/
-__pycache__/
-*.pyc
-.DS_Store
-*.mp4
-*.avi
-*.mov
-data/raw/*
-data/processed/*
+env/
+ENV/
+
+# Models (large files - NOT for GitHub)
+*.pt
+*.pth
+*.onnx
+*.h5
+*.pb
 models/*.pt
+sam_b.pt
+yolov8n.pt
+yolov9c.pt
+yolov9e.pt
 runs/
+
+# Datasets (large files)
+datasets/
+dataset/
+HomeObjects-3K/
+
+# Test data (videos/images)
+test_data/*.mp4
+test_data/*.mov
+test_data/*.avi
+test_data/*.jpg
+test_data/*.png
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+yolov9_train_*.out
+yolov9_train_*.err
+
+# Streamlit
+.streamlit/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment
 .env
+.env.local
+
+# Output
+outputs/
+*.json
+!config/*.json
+
+# Backup
+*_backup_*
+*_old_*
+app_old*
+
+# Temporary
+*.tmp
+*.bak
+test_job.slurm
+test_output.txt
+runtime.txt
+
+# SSH keys (accidental files)
+ssh-copy-id*

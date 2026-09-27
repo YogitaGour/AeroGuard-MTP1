@@ -7,3 +7,9 @@ ultralytics
 torch
 torchvision
 plotly==5.20.0
+scikit-learn
+shapely
+langchain
+langchain-community
+langchain-openai
+openai

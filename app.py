@@ -1,423 +1,411 @@
-# app.py – Full AeroGuard with All Fixes
+# app.py – Complete AeroGuard with SLAM + 3D Visualization (Fixed Version)
+
 import streamlit as st
 import cv2
 import tempfile
 import numpy as np
 import pandas as pd
 from PIL import Image
-from ultralytics import YOLO
-from src.temporal_tracker import TemporalTracker
+from ultralytics import YOLO, SAM
+from src.slam_processor import SLAMProcessor, Object3DProjector
 from src.dust_simulator import DustSimulator
 from src.visualizer import plot_risk_heatmap
 import os
-import random
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import json
 
-st.set_page_config(page_title="AeroGuard", layout="wide")
-st.title("🛡️ AeroGuard – A 3D Digital Twin Simulator for Indoor Dust Allergy Risk Assessment")
+st.set_page_config(page_title="AeroGuard – 3D Digital Twin", layout="wide")
+st.title("🛡️ AeroGuard – 3D Digital Twin with SLAM")
 
 # -------------------------------
-# Load fine-tuned model
+# Load Models
 # -------------------------------
 @st.cache_resource
-def load_model():
-    if os.path.exists("models/best_homeobjects.pt"):
-        model = YOLO("models/best_homeobjects.pt")
-        st.sidebar.success("✅ Loaded fine-tuned model (HomeObjects-3K)")
-    else:
-        model = YOLO("yolov8n.pt")
-        st.sidebar.info("ℹ️ Using default YOLOv8n model")
-    return model
+def load_models():
+    """Load YOLO and SAM models."""
+    models = {}
+    
+    # Try new trained model first
+    model_paths = [
+        "runs/detect/yolov9_homeobjects_150epochs/weights/best.pt",  # HPC trained
+        "models/best_homeobjects.pt",  # Local copy
+        "yolov9c.pt"  # Fallback
+    ]
+    
+    loaded = False
+    for path in model_paths:
+        if os.path.exists(path):
+            try:
+                models['yolo'] = YOLO(path)
+                st.sidebar.success(f"✅ Loaded: {path}")
+                loaded = True
+                break
+            except Exception as e:
+                continue
+    
+    if not loaded:
+        models['yolo'] = YOLO("yolov9c.pt")
+        st.sidebar.info("ℹ️ Using default YOLO model")
+    
+    # SAM for segmentation (optional)
+    try:
+        models['sam'] = SAM("sam_b.pt")
+        st.sidebar.success("✅ Loaded SAM model")
+    except:
+        models['sam'] = None
+        st.sidebar.warning("⚠️ SAM not available - using YOLO only")
+    
+    return models
 
-model = load_model()
+models = load_models()
 
 # -------------------------------
-# Sidebar settings
+# Sidebar Settings
 # -------------------------------
 with st.sidebar:
     st.header("⚙️ Detection Settings")
-    conf_thresh = st.slider("Confidence Threshold", 0.0, 1.0, 0.1, 0.05,
-                            help="Lower = more detections, but may include false positives. We ignore <10%.")
-    show_all_objects = st.checkbox("Show all detected objects in table", value=False,
-                                   help="If unchecked, only furniture (bed, sofa, chair, table, lamp, TV, fridge, wardrobe) are shown.")
-    manual_scale = st.number_input("Manual scale (cm/pixel) – 0 to use auto", value=0.0, step=0.05,
-                                   help="Override automatic calibration. Typical values: 0.2–0.5.")
+    conf_thresh = st.slider("Confidence Threshold", 0.0, 1.0, 0.25, 0.05)
+    use_sam = st.checkbox("Use SAM for segmentation (slower)", value=False)
     
-    st.header("🌫️ Dust Simulation Parameters")
+    st.header("🏠 Room Geometry")
+    room_height_cm = st.number_input("Room height (cm)", 200, 350, 250)
+    
+    st.header("🌫️ Dust Simulation")
     fan_speed = st.slider("Fan Speed (%)", 0, 100, 50)
     window_open = st.checkbox("Window Open", value=False)
     humidity = st.slider("Humidity (%)", 0, 100, 50)
     aqi = st.slider("AQI (Air Quality Index)", 0, 500, 100)
     
-    st.header("🏠 Room Geometry (approximate)")
-    room_height_cm = st.number_input("Room height (cm)", 200, 350, 250)
-    room_width_cm = st.number_input("Room width (cm)", 200, 800, 400)
-    room_depth_cm = st.number_input("Room depth (cm)", 200, 800, 400)
-    
-    st.markdown("---")
-    st.info("Dust risk is based on furniture layout and environmental factors, not on confidence threshold.")
+    st.header("🎨 3D Visualization")
+    show_pointcloud = st.checkbox("Show Point Cloud", value=True)
+    show_trajectory = st.checkbox("Show Camera Trajectory", value=True)
+    show_objects = st.checkbox("Show Object Bounding Boxes", value=True)
+    show_particles = st.checkbox("Show Dust Particles", value=True)
 
 # -------------------------------
-# Helper functions
+# Helper Functions
 # -------------------------------
-def compute_iou(box1, box2):
-    x1, y1, x2, y2 = box1
-    x1b, y1b, x2b, y2b = box2
-    xi1 = max(x1, x1b)
-    yi1 = max(y1, y1b)
-    xi2 = min(x2, x2b)
-    yi2 = min(y2, y2b)
-    inter = max(0, xi2 - xi1) * max(0, yi2 - yi1)
-    area1 = (x2 - x1) * (y2 - y1)
-    area2 = (x2b - x1b) * (y2b - y1b)
-    union = area1 + area2 - inter
-    return inter / union if union > 0 else 0
-
-def nms(detections, iou_threshold=0.5, min_conf=0.25):
-    """Better NMS to remove duplicate detections"""
+def aggregate_2d_detections(all_detections):
+    """Aggregate 2D detections by class."""
+    class_groups = {}
+    for det in all_detections:
+        cls = det['class_name']
+        if cls not in class_groups:
+            class_groups[cls] = []
+        class_groups[cls].append(det)
     
-    # Filter low confidence first
-    detections = [d for d in detections if d['confidence'] >= min_conf]
-    
-    # Sort by confidence (highest first)
-    detections = sorted(detections, key=lambda x: x['confidence'], reverse=True)
-    
-    final_detections = []
-
-    for det in detections:
-        keep = True
+    aggregated = []
+    for cls, dets in class_groups.items():
+        confs = [d['confidence'] for d in dets]
         
-        for kept in final_detections:
-            iou = compute_iou(det['bbox'], kept['bbox'])
-            
-            # 🔥 Remove if overlapping too much (duplicate)
-            if iou > iou_threshold:
-                keep = False
-                break
+        # Average bbox size
+        widths = [d['bbox'][2] - d['bbox'][0] for d in dets]
+        heights = [d['bbox'][3] - d['bbox'][1] for d in dets]
         
-        if keep:
-            final_detections.append(det)
-
-    return final_detections
-
-def calibrate_scale(detections, known_object='door', known_height_cm=200):
-    for d in detections:
-        if d['class_name'].lower() == known_object and d['height_px'] > 0:
-            scale = known_height_cm / d['height_px']
-            return scale, known_object
-    return None, None
-
-def detections_to_dataframe(detections, scale):
-    """Convert detections to DataFrame (all objects)."""
-    rows = []
-    for d in detections:
-        width_cm = d['width_px'] * scale
-        height_cm = d['height_px'] * scale
-        rows.append({
-            "Object": d['class_name'].capitalize(),
-            "Width (cm)": round(width_cm, 1),
-            "Height (cm)": round(height_cm, 1),
-            "Confidence": f"{d['confidence']:.0%}"
+        aggregated.append({
+            'class_name': cls,
+            'confidence': float(np.mean(confs)),
+            'detections_count': len(dets),
+            'width': float(np.mean(widths)) / 100.0,  # Convert to meters approx
+            'height': float(np.mean(heights)) / 100.0,
+            'depth': 0.5,  # Placeholder
+            'center': [0, 0, 0],  # Placeholder for 3D
+            'avg_bbox': (
+                int(np.mean([d['bbox'][0] for d in dets])),
+                int(np.mean([d['bbox'][1] for d in dets])),
+                int(np.mean([d['bbox'][2] for d in dets])),
+                int(np.mean([d['bbox'][3] for d in dets]))
+            )
         })
-    return pd.DataFrame(rows)
-
-def detections_to_furniture(detections, scale, room_width, room_depth):
-    """Returns (furniture_list, df_all, df_furniture)."""
-    furniture = []
-    all_rows = []
-    furniture_rows = []
-    furniture_classes = ['bed','sofa','chair','table','lamp','tv','refrigerator','wardrobe']
     
-    for d in detections:
-        width_cm = d['width_px'] * scale
-        height_cm = d['height_px'] * scale
-        depth_cm = width_cm * 0.8   # rough assumption
-        
-        # Estimate position
-        if 'bbox' in d:
-            cx = (d['bbox'][0] + d['bbox'][2]) / 2
-            cy = (d['bbox'][1] + d['bbox'][3]) / 2
-            x = cx / 640 * room_width   # assume YOLO input size 640
-            z = cy / 640 * room_depth
-        else:
-            x = random.uniform(width_cm/2, room_width - width_cm/2)
-            z = random.uniform(depth_cm/2, room_depth - depth_cm/2)
-        x = max(0, min(room_width - width_cm, x))
-        z = max(0, min(room_depth - depth_cm, z))
-        y = 0  # floor
-        
-        row = {
-            "Object": d['class_name'].capitalize(),
-            "Width (cm)": round(width_cm, 1),
-            "Height (cm)": round(height_cm, 1),
-            "Confidence": f"{d['confidence']:.0%}"
-        }
-        all_rows.append(row)
-        if d['class_name'].lower() in furniture_classes:
-            furniture_rows.append(row)
-            furniture.append((x, y, z, width_cm, height_cm, depth_cm))
-    
-    df_all = pd.DataFrame(all_rows)
-    df_furniture = pd.DataFrame(furniture_rows)
-    return furniture, df_all, df_furniture
+    return aggregated
 
-def create_3d_room_visualization(furniture, room_width, room_height, room_depth):
-    """Create a 3D Plotly figure with room wireframe and furniture cubes."""
+def create_3d_visualization(slam_results, objects_3d, dust_data=None):
+    """Create 3D visualization."""
     fig = go.Figure()
-    # Room wireframe (floor)
-    floor_corners = [[0,0,0], [room_width,0,0], [room_width,0,room_depth], [0,0,room_depth]]
-    for i in range(4):
+    
+    # 1. Point Cloud
+    if show_pointcloud and slam_results.get('point_cloud') and len(slam_results['point_cloud']) > 0:
+        pts = np.array(slam_results['point_cloud'])
+        if len(pts) > 5000:
+            idx = np.random.choice(len(pts), 5000, replace=False)
+            pts = pts[idx]
+        
         fig.add_trace(go.Scatter3d(
-            x=[floor_corners[i][0], floor_corners[(i+1)%4][0]],
-            y=[floor_corners[i][1], floor_corners[(i+1)%4][1]],
-            z=[floor_corners[i][2], floor_corners[(i+1)%4][2]],
-            mode='lines', line=dict(color='black', width=2), showlegend=False
+            x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
+            mode='markers',
+            marker=dict(size=1, color='lightgray', opacity=0.5),
+            name='Point Cloud'
         ))
-    # Vertical lines
-    for x,y,z in floor_corners[:2]:
+    
+    # 2. Camera Trajectory
+    if show_trajectory and slam_results.get('camera_trajectory'):
+        poses = np.array([p[:3, 3] for p in slam_results['camera_trajectory']])
         fig.add_trace(go.Scatter3d(
-            x=[x, x], y=[0, room_height], z=[z, z],
-            mode='lines', line=dict(color='black', width=2), showlegend=False
+            x=poses[:, 0], y=poses[:, 1], z=poses[:, 2],
+            mode='lines+markers',
+            line=dict(color='red', width=3),
+            marker=dict(size=3, color='red'),
+            name='Camera Path'
         ))
-    # Furniture as cubes
-    for (x,y,z,w,h,d) in furniture:
-        # 8 vertices of the cube
-        vertices = np.array([
-            [x, y, z], [x+w, y, z], [x+w, y+h, z], [x, y+h, z],
-            [x, y, z+d], [x+w, y, z+d], [x+w, y+h, z+d], [x, y+h, z+d]
-        ])
-        faces = np.array([
-            [0,1,2,3], [4,5,6,7], [0,1,5,4],
-            [3,2,6,7], [0,3,7,4], [1,2,6,5]
-        ])
-        for face in faces:
-            fig.add_trace(go.Mesh3d(
-                x=vertices[face,0], y=vertices[face,1], z=vertices[face,2],
-                color='lightblue', opacity=0.6, showlegend=False
+    
+    # 3. Object positions (2D projected)
+    if show_objects and objects_3d:
+        colors = {
+            'bed': '#1f77b4', 'sofa': '#ff7f0e', 'chair': '#2ca02c',
+            'table': '#d62728', 'lamp': '#9467bd', 'tv': '#8c564b',
+            'laptop': '#e377c2', 'wardrobe': '#7f7f7f',
+            'window': '#17becf', 'door': '#bcbd22',
+            'potted plant': '#98df8a', 'photo frame': '#ff9896'
+        }
+        
+        for i, obj in enumerate(objects_3d):
+            color = colors.get(obj['class_name'], '#aaaaaa')
+            
+            # Place objects in 3D space (simple layout)
+            angle = (i / max(len(objects_3d), 1)) * 2 * np.pi
+            radius = 2.0
+            x = radius * np.cos(angle)
+            y = 0
+            z = radius * np.sin(angle)
+            
+            # Add object marker
+            fig.add_trace(go.Scatter3d(
+                x=[x], y=[y], z=[z],
+                mode='markers+text',
+                marker=dict(size=15, color=color, symbol='square'),
+                text=[f"{obj['class_name']}<br>{obj['confidence']:.0%}"],
+                textposition='top center',
+                name=obj['class_name'],
+                showlegend=False,
+                hovertemplate=f"<b>{obj['class_name']}</b><br>" +
+                             f"Confidence: {obj['confidence']:.1%}<br>" +
+                             f"Detections: {obj['detections_count']}<extra></extra>"
             ))
+    
+    # 4. Dust Particles
+    if dust_data is not None and show_particles:
+        risk_map = dust_data.get('risk_map')
+        if risk_map is not None:
+            high_risk = np.where(risk_map == 3)
+            if len(high_risk[0]) > 0:
+                n_samples = min(500, len(high_risk[0]))
+                indices = np.random.choice(len(high_risk[0]), n_samples, replace=False)
+                particle_positions = np.array([
+                    high_risk[0][indices],
+                    high_risk[1][indices],
+                    high_risk[2][indices]
+                ]).T
+                
+                fig.add_trace(go.Scatter3d(
+                    x=particle_positions[:, 0] * 0.1,
+                    y=particle_positions[:, 1] * 0.1,
+                    z=particle_positions[:, 2] * 0.1,
+                    mode='markers',
+                    marker=dict(size=5, color='red', opacity=0.5),
+                    name='Dust Particles'
+                ))
+    
     fig.update_layout(
-        title="Simplified 3D Room Layout",
+        title="3D Room Reconstruction with SLAM + Object Detection",
         scene=dict(
-            xaxis_title="Width (cm)", yaxis_title="Height (cm)", zaxis_title="Depth (cm)",
-            aspectmode='data'
+            xaxis_title="X (meters)",
+            yaxis_title="Y (meters)",
+            zaxis_title="Z (meters)",
+            aspectmode='data',
+            camera=dict(eye=dict(x=1.5, y=1.5, z=1.5)),
+            bgcolor='rgba(0,0,0,0)'
         ),
-        width=700, height=500
+        width=900,
+        height=600,
+        margin=dict(l=0, r=0, t=30, b=0),
+        legend=dict(x=1.02, y=1, xanchor='left', yanchor='top'),
+        hovermode='closest'
     )
+    
     return fig
 
-# -------------------------------
-# Input type selection
-# -------------------------------
-input_type = st.radio("Select input type:", ["📸 Image", "🎥 Video"], horizontal=True)
+def process_video_with_slam(uploaded_video, model, conf_thresh, use_sam=False):
+    """Process video with SLAM + object detection pipeline (FIXED)."""
+    # Save uploaded video
+    tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+    tfile.write(uploaded_video.read())
+    video_path = tfile.name
+    
+    try:
+        # Step 1: Run SLAM
+        st.write("🔄 Running SLAM on video...")
+        slam = SLAMProcessor()
+        slam_results = slam.process_video(video_path, frame_interval=10)
+        
+        # Step 2: Run object detection on keyframes
+        st.write("🔍 Detecting objects in keyframes...")
+        all_detections = []  # Store ALL detections (2D)
+        progress_bar = st.progress(0)
+        
+        detection_frames = slam_results['detection_frames']
+        
+        for i, frame in enumerate(detection_frames):
+            # Run YOLO detection
+            results = model(frame, conf=conf_thresh, verbose=False)
+            
+            for box in results[0].boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
+                all_detections.append({
+                    'class_name': model.names[int(box.cls[0])],
+                    'bbox': (x1, y1, x2, y2),
+                    'confidence': float(box.conf[0]),
+                    'frame_idx': i
+                })
+            
+            progress_bar.progress((i + 1) / len(detection_frames))
+        
+        # Step 3: Aggregate detections by class
+        st.write(f"📊 Aggregating {len(all_detections)} detections...")
+        aggregated = aggregate_2d_detections(all_detections)
+        
+        st.success(f"✅ Found {len(aggregated)} unique objects from {len(all_detections)} detections")
+        
+        # Step 4: Run dust simulation
+        st.write("🌫️ Running dust simulation...")
+        sim = DustSimulator(400, room_height_cm, 400)
+        dust = sim.simulate_dust(fan_speed, window_open, humidity, aqi)
+        risk = sim.classify_risk(dust)
+        
+        dust_data = {
+            'concentration': dust,
+            'risk_map': risk
+        }
+        
+        return {
+            'objects_3d': aggregated,
+            'point_cloud': slam_results.get('point_cloud', []),
+            'camera_trajectory': slam_results.get('camera_poses', []),
+            'scale': slam_results.get('scale', 1.0),
+            'keyframes_count': len(detection_frames),
+            'dust_data': dust_data,
+            'furniture': [],
+            'all_detections': all_detections,
+            'model_classes': list(model.names.values())
+        }
+        
+    finally:
+        if os.path.exists(video_path):
+            os.unlink(video_path)
 
-MIN_OBJECTS = 2
-DEFAULT_FURNITURE = [
-    (100, 0, 100, 90, 190, 90),   # bed
-    (300, 0, 200, 60, 75, 60),    # table
-    (250, 0, 250, 50, 80, 50),    # chair
-]
+# -------------------------------
+# Main App
+# -------------------------------
+input_type = st.radio("Select input type:", ["📸 Image", "🎥 Video (Recommended)"], horizontal=True)
 
-# -------------------------------
-# IMAGE PROCESSING
-# -------------------------------
 if input_type == "📸 Image":
     uploaded_img = st.file_uploader("Upload a room image", type=["jpg", "jpeg", "png"])
     if uploaded_img:
-        image = Image.open(uploaded_img).convert("RGB")
-        img_np = np.array(image)
-        col1, col2 = st.columns(2)
-        with col1:
-            st.image(image, caption="Uploaded Image", use_container_width=True)
+        st.info("Image processing with 3D reconstruction is simplified. Use Video for full 3D.")
+
+else:  # Video
+    uploaded_video = st.file_uploader(
+        "Upload a room video (walk slowly, cover all corners)", 
+        type=["mp4", "mov", "avi"],
+        help="For best results: walk slowly, keep camera stable, cover all areas of the room"
+    )
+    
+    if uploaded_video:
+        with st.spinner("Processing video with SLAM and object detection..."):
+            results = process_video_with_slam(
+                uploaded_video, 
+                models['yolo'], 
+                conf_thresh,
+                use_sam
+            )
         
-        # Run detection
-        results = model(img_np, conf=conf_thresh)
-        annotated = results[0].plot()
-        with col2:
-            st.image(annotated, caption="Detected Objects", use_container_width=True)
+        # Display summary
+        st.success(f"✅ Processed {results['keyframes_count']} keyframes, found {len(results['objects_3d'])} unique objects")
         
-        # Extract raw detections
-        raw_dets = []
-        for box in results[0].boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
-            raw_dets.append({
-                'class_name': model.names[int(box.cls[0])],
-                'bbox': (x1, y1, x2, y2),
-                'width_px': x2 - x1,
-                'height_px': y2 - y1,
-                'confidence': float(box.conf[0])
-            })
-        # Apply NMS and confidence filter
-        detections = nms(raw_dets, iou_threshold=0.3, min_conf=0.1)
+        # Show scale
+        st.info(f"📏 Estimated scale: {results['scale']:.3f} cm/unit")
         
-        if detections:
-            # Scale calibration
-            if manual_scale > 0:
-                scale = manual_scale
-                st.info(f"Using manual scale: {scale:.3f} cm/pixel")
-            else:
-                scale, ref_obj = calibrate_scale(detections)
-                if scale is None:
-                    scale, ref_obj = calibrate_scale(detections, known_object='window', known_height_cm=120)
-                if scale is None:
-                    scale = 0.25
-                    st.warning("No door or window detected. Using default scale (0.25 cm/pixel).")
-                else:
-                    st.success(f"Calibrated using {ref_obj}: scale = {scale:.3f} cm/pixel")
-            
-            # Convert to furniture and DataFrames
-            furniture, df_all, df_furniture = detections_to_furniture(detections, scale, room_width_cm, room_depth_cm)
-            st.subheader("📊 Detected Objects")
-            if show_all_objects:
-                st.dataframe(df_all, use_container_width=True)
-            else:
-                st.dataframe(df_furniture, use_container_width=True)
-            
-            # Dust simulation uses furniture (even if less than MIN_OBJECTS, we still use detected)
-            if len(furniture) < MIN_OBJECTS:
-                st.warning(f"Only {len(furniture)} furniture pieces detected. Using default furniture layout for simulation.")
-                furniture = DEFAULT_FURNITURE
+        # Show 3D objects table
+        if results['objects_3d']:
+            st.subheader("📊 3D Objects Detected")
+            df = pd.DataFrame([{
+                'Object': obj['class_name'].capitalize(),
+                'Confidence': f"{obj['confidence']:.0%}",
+                'Detections': obj['detections_count'],
+                'Width (px)': f"{obj['width']*100:.0f}",
+                'Height (px)': f"{obj['height']*100:.0f}"
+            } for obj in results['objects_3d']])
+            st.dataframe(df, use_container_width=True)
         else:
-            st.warning("No objects detected after filtering. Using default furniture layout.")
-            furniture = DEFAULT_FURNITURE
-            df_all = df_furniture = pd.DataFrame()
+            st.warning("⚠️ No objects detected. Try lowering the confidence threshold.")
+            if 'model_classes' in results:
+                st.info(f"Model classes: {results['model_classes']}")
         
-        # Dust simulation (always runs)
-        sim = DustSimulator(room_width_cm, room_height_cm, room_depth_cm)
-        for (x, y, z, w, h, d) in furniture:
-            sim.add_furniture(x, y, z, w, h, d)
-        dust = sim.simulate_dust(fan_speed, window_open, humidity, aqi)
-        risk = sim.classify_risk(dust)
+        # Risk zones
+        dust_data = results.get('dust_data')
+        if dust_data:
+            risk = dust_data['risk_map']
+            low_pct = np.sum(risk==1)/risk.size*100
+            med_pct = np.sum(risk==2)/risk.size*100
+            high_pct = np.sum(risk==3)/risk.size*100
+            
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("🟢 Low Risk", f"{low_pct:.1f}%")
+            col2.metric("🟡 Medium Risk", f"{med_pct:.1f}%")
+            col3.metric("🔴 High Risk", f"{high_pct:.1f}%")
+            col4.metric("Objects Found", len(results['objects_3d']))
         
-        low_pct = np.sum(risk==1)/risk.size*100
-        med_pct = np.sum(risk==2)/risk.size*100
-        high_pct = np.sum(risk==3)/risk.size*100
-        col1, col2, col3 = st.columns(3)
-        col1.metric("🟢 Low Risk Zones", f"{low_pct:.1f}%")
-        col2.metric("🟡 Medium Risk Zones", f"{med_pct:.1f}%")
-        col3.metric("🔴 High Risk Zones", f"{high_pct:.1f}%")
+        # 3D Visualization
+        st.subheader("🏠 3D Room Reconstruction")
         
-        # 3D heatmap
-        fig_heat = plot_risk_heatmap(dust)
-        st.plotly_chart(fig_heat, use_container_width=True)
-        
-        # 3D room visualisation
-        fig_room = create_3d_room_visualization(furniture, room_width_cm, room_height_cm, room_depth_cm)
-        st.plotly_chart(fig_room, use_container_width=True)
+        fig = create_3d_visualization(
+            results,
+            results['objects_3d'],
+            results.get('dust_data')
+        )
+        st.plotly_chart(fig, use_container_width=True)
         
         # Recommendations
         st.subheader("💡 Recommendations")
-        if high_pct > 30:
-            st.error("⚠️ High dust risk detected! Increase ventilation, clean more often, or use an air purifier.")
-        elif high_pct > 10:
-            st.warning("⚠️ Moderate dust risk. Consider opening windows or reducing humidity.")
-        else:
-            st.success("✅ Low dust risk. Keep up with regular cleaning.")
+        
+        if dust_data:
+            high_pct = np.sum(dust_data['risk_map']==3)/dust_data['risk_map'].size*100
+            if high_pct > 30:
+                st.error("⚠️ High dust risk detected! Increase ventilation.")
+            elif high_pct > 10:
+                st.warning("⚠️ Moderate dust risk. Consider opening windows.")
+            else:
+                st.success("✅ Low dust risk. Keep up with regular cleaning.")
+        
         if fan_speed < 30:
             st.write("💨 Increase fan speed to improve air circulation.")
         if not window_open and humidity > 60:
-            st.write("🪟 Open windows to reduce humidity and dust concentration.")
+            st.write("🪟 Open windows to reduce humidity.")
         if aqi > 150:
-            st.write("🌫️ Poor outdoor air quality. Keep windows closed and use an air purifier.")
-        print("Dust value in image",np.max(dust))
-# -------------------------------
-# VIDEO PROCESSING (similar but uses temporal tracker)
-# -------------------------------
-else:
-    uploaded_video = st.file_uploader("Upload a room video (MP4, MOV, AVI)", type=["mp4", "mov", "avi"])
-    if uploaded_video:
-        tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        tfile.write(uploaded_video.read())
-        cap = cv2.VideoCapture(tfile.name)
-        tracker = TemporalTracker()
-        all_detections = []
-        progress = st.progress(0)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        frame_count = 0
-        status = st.empty()
+            st.write("🌫️ Poor outdoor air quality. Keep windows closed.")
         
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            if frame_count % 5 == 0:
-                results = model(frame, conf=conf_thresh)
-                dets = []
-                for box in results[0].boxes:
-                    x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
-                    dets.append({
-                        'class_name': model.names[int(box.cls[0])],
-                        'bbox': (x1, y1, x2, y2),
-                        'confidence': float(box.conf[0])
-                    })
-                tracked = tracker.update(dets)  # returns list with width_px, height_px, confidence, class_name
-                # Add width_px, height_px to tracked (tracker already has them)
-                all_detections.extend(tracked)
-            frame_count += 1
-            progress.progress(frame_count / total_frames)
-            status.text(f"Processing frame {frame_count}/{total_frames}")
-        cap.release()
-        status.text("Processing complete!")
-        
-        # Filter low confidence and apply NMS (tracker already does some merging)
-        all_detections = [d for d in all_detections if d.get('confidence', 0) >= 0.1]
-        
-        if all_detections:
-            if manual_scale > 0:
-                scale = manual_scale
-                st.info(f"Using manual scale: {scale:.3f} cm/pixel")
-            else:
-                scale, ref_obj = calibrate_scale(all_detections)
-                if scale is None:
-                    scale, ref_obj = calibrate_scale(all_detections, known_object='window', known_height_cm=120)
-                if scale is None:
-                    scale = 0.25
-                    st.warning("No door or window detected. Using default scale (0.25 cm/pixel).")
-                else:
-                    st.success(f"Calibrated using {ref_obj}: scale = {scale:.3f} cm/pixel")
-            
-            furniture, df_all, df_furniture = detections_to_furniture(all_detections, scale, room_width_cm, room_depth_cm)
-            st.subheader("📊 Detected Objects")
-            if show_all_objects:
-                st.dataframe(df_all, use_container_width=True)
-            else:
-                st.dataframe(df_furniture, use_container_width=True)
-            
-            if len(furniture) < MIN_OBJECTS:
-                st.warning(f"Only {len(furniture)} furniture pieces detected. Using default furniture layout.")
-                furniture = DEFAULT_FURNITURE
-        else:
-            st.warning("No objects detected after filtering. Using default furniture layout.")
-            furniture = DEFAULT_FURNITURE
-        
-        # Dust simulation
-        sim = DustSimulator(room_width_cm, room_height_cm, room_depth_cm)
-        for (x, y, z, w, h, d) in furniture:
-            sim.add_furniture(x, y, z, w, h, d)
-        dust = sim.simulate_dust(fan_speed, window_open, humidity, aqi)
-        risk = sim.classify_risk(dust)
-        
-        low_pct = np.sum(risk==1)/risk.size*100
-        med_pct = np.sum(risk==2)/risk.size*100
-        high_pct = np.sum(risk==3)/risk.size*100
-        col1, col2, col3 = st.columns(3)
-        col1.metric("🟢 Low Risk Zones", f"{low_pct:.1f}%")
-        col2.metric("🟡 Medium Risk Zones", f"{med_pct:.1f}%")
-        col3.metric("🔴 High Risk Zones", f"{high_pct:.1f}%")
-        
-        fig_heat = plot_risk_heatmap(dust)
-        st.plotly_chart(fig_heat, use_container_width=True)
-        
-        fig_room = create_3d_room_visualization(furniture, room_width_cm, room_height_cm, room_depth_cm)
-        st.plotly_chart(fig_room, use_container_width=True)
-        
-        st.subheader("💡 Recommendations")
-        if high_pct > 30:
-            st.error("⚠️ High dust risk detected! Improve ventilation and cleaning.")
-        elif high_pct > 10:
-            st.warning("⚠️ Moderate dust risk. Increase fan speed or open windows.")
-        else:
-            st.success("✅ Low dust risk. Good air quality!")  
-         
-        np.max(dust)
-        print("Dust value in video",np.max(dust))
+        # Export data
+        if st.button("📥 Export 3D Data (JSON)"):
+            export_data = {
+                'objects': results['objects_3d'],
+                'furniture': results['furniture'],
+                'scale': results['scale'],
+                'keyframes': results['keyframes_count']
+            }
+            json_str = json.dumps(export_data, indent=2, default=str)
+            st.download_button(
+                label="Download JSON",
+                data=json_str,
+                file_name="aeroGuard_3d_data.json",
+                mime="application/json"
+            )
 
+# Footer
+st.markdown("---")
+st.markdown("""
+<div style="text-align: center; color: gray; padding: 1rem;">
+    <p>AeroGuard – 3D Digital Twin for Indoor Dust Allergy Risk</p>
+    <p>Powered by YOLO, SLAM, and 3D Visualization</p>
+</div>
+""", unsafe_allow_html=True)
