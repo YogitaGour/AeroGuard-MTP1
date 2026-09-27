@@ -82,3 +82,17 @@ runtime.txt
 
 # SSH keys (accidental files)
 ssh-copy-id*
+
+# ProClosure large files
+proclosure/thirdparty/
+proclosure/logs/
+proclosure/mast3r_slam/
+models/mast3r/
+*.pth
+
+# ProClosure outputs
+room_metadata.json
+room_result.png
+*_full.ply
+*_wall.ply
+thumbnails_metadata.json
